@@ -1,3 +1,4 @@
+import contextlib
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -43,13 +44,13 @@ def hf_list_models(
     query: str
 ) -> list[Model]:
     from huggingface_hub import HfApi, ModelFilter
-    
+
     if hasattr(self, "huggingface_hub_api"):
         api: HfApi = self.huggingface_hub_api
     else:
         api = HfApi()
         setattr(self, "huggingface_hub_api", api)
-    
+
     filter = ModelFilter(tags="diffusers", task="text-to-image")
     models = api.list_models(
         filter=filter,
@@ -60,34 +61,41 @@ def hf_list_models(
 
 def hf_list_installed_models(self) -> list[Model]:
     from diffusers.utils import DIFFUSERS_CACHE
-    if not os.path.exists(DIFFUSERS_CACHE):
+    DIFFUSERS_CACHE = Path(DIFFUSERS_CACHE)
+
+    if not DIFFUSERS_CACHE.exists():
         return []
     def _map_model(file):
-        storage_folder = os.path.join(DIFFUSERS_CACHE, file)
-        if os.path.exists(os.path.join(storage_folder, 'model_index.json')):
+        storage_folder = DIFFUSERS_CACHE / file
+        snapshot_folder = None
+        if ((storage_folder / 'model_index.json').exists()):
             snapshot_folder = storage_folder
         else:
             revision = "main"
-            ref_path = os.path.join(storage_folder, "refs", revision)
-            with open(ref_path) as f:
-                commit_hash = f.read()
-
-            snapshot_folder = os.path.join(storage_folder, "snapshots", commit_hash)
+            ref_path = storage_folder / "refs" / revision
+            if (ref_path.exists()):
+                commit_hash = ref_path.read_text()
+                snapshot_folder = storage_folder / "snapshots" / commit_hash
+            else:
+                print(f"Could not find {revision} in {ref_path.parent.as_posix()}")
+                print(f"Candidates: {[x.stem for x in ref_path.parent.iterdir()]}")
         model_type = ModelType.UNKNOWN
-        try:
-            with open(os.path.join(snapshot_folder, 'unet', 'config.json'), 'r') as f:
-                model_type = ModelType(json.load(f)['in_channels'])
-        except:
-            pass
+
+        if (snapshot_folder):
+            with contextlib.suppress(Exception):
+                with open(snapshot_folder / 'unet' / 'config.json', 'r') as f:
+                    model_type = ModelType(json.load(f)['in_channels'])
+
         return Model(
-            storage_folder,
+            storage_folder.as_posix(),
             "",
             [],
             -1,
             -1,
             model_type
         )
-    return [_map_model(file) for file in os.listdir(DIFFUSERS_CACHE) if os.path.isdir(os.path.join(DIFFUSERS_CACHE, file))]
+
+    return [_map_model(file) for file in DIFFUSERS_CACHE.iterdir() if file.is_dir()]
 
 @dataclass
 class DownloadStatus:
@@ -161,7 +169,7 @@ def hf_snapshot_download(
         )
         hf_raise_for_status(r)
         content_length = r.headers.get("Content-Length")
-        total = resume_size + int(content_length) if content_length is not None else None
+        total = resume_size + int(content_length) if content_length is not None else 0
         progress = 0
         previous_value = 0
         for chunk in r.iter_content(chunk_size=1024):
@@ -230,14 +238,15 @@ def hf_snapshot_download(
             cache_dir = HUGGINGFACE_HUB_CACHE
         if revision is None:
             revision = DEFAULT_REVISION
-        if isinstance(cache_dir, Path):
-            cache_dir = str(cache_dir)
+        if isinstance(cache_dir, str):
+            cache_dir = Path(cache_dir)
 
-        if subfolder == "":
-            subfolder = None
-        if subfolder is not None:
+        url_name = filename
+
+        if not subfolder or subfolder == "":
             # This is used to create a URL, and not a local path, hence the forward slash.
-            filename = f"{subfolder}/{filename}"
+            url_name = f"{subfolder}/{filename}"
+            subfolder = ""
 
         if repo_type is None:
             repo_type = "model"
@@ -247,24 +256,18 @@ def hf_snapshot_download(
                 f" {str(REPO_TYPES)}"
             )
 
-        storage_folder = os.path.join(
-            cache_dir, repo_folder_name(repo_id=repo_id, repo_type=repo_type)
-        )
-        os.makedirs(storage_folder, exist_ok=True)
-
-        # cross platform transcription of filename, to be used as a local file path.
-        relative_filename = os.path.join(*filename.split("/"))
+        storage_folder = cache_dir / repo_folder_name(repo_id=repo_id, repo_type=repo_type)
+        storage_folder.mkdir(parents=True,exist_ok=True)
 
         # if user provides a commit_hash and they already have the file on disk,
         # shortcut everything.
         if REGEX_COMMIT_HASH.match(revision):
-            pointer_path = os.path.join(
-                storage_folder, "snapshots", revision, relative_filename
-            )
-            if os.path.exists(pointer_path):
-                return pointer_path
+            pointer_path = storage_folder / "snapshots" / revision / subfolder / filename
 
-        url = hf_hub_url(repo_id, filename, repo_type=repo_type, revision=revision)
+            if (pointer_path).exists():
+                return pointer_path.as_posix()
+
+        url = hf_hub_url(repo_id, url_name, repo_type=repo_type, revision=revision)
 
         headers = build_hf_headers(
             use_auth_token=use_auth_token,
@@ -292,10 +295,11 @@ def hf_snapshot_download(
                     )
                     if commit_hash is not None and not legacy_cache_layout:
                         no_exist_file_path = (
-                            Path(storage_folder)
+                            storage_folder
                             / ".no_exist"
                             / commit_hash
-                            / relative_filename
+                            / subfolder
+                            / filename
                         )
                         no_exist_file_path.parent.mkdir(parents=True, exist_ok=True)
                         no_exist_file_path.touch()
@@ -361,15 +365,12 @@ def hf_snapshot_download(
             if REGEX_COMMIT_HASH.match(revision):
                 commit_hash = revision
             else:
-                ref_path = os.path.join(storage_folder, "refs", revision)
-                with open(ref_path) as f:
-                    commit_hash = f.read()
+                ref_path = storage_folder / "refs" / revision
+                commit_hash = ref_path.read_text()
 
-            pointer_path = os.path.join(
-                storage_folder, "snapshots", commit_hash, relative_filename
-            )
-            if os.path.exists(pointer_path):
-                return pointer_path
+            pointer_path = storage_folder / "snapshots" / commit_hash / subfolder / filename
+            if pointer_path.exists():
+                return pointer_path.as_posix()
 
             # If we couldn't find an appropriate file on disk,
             # raise an error.
@@ -390,57 +391,44 @@ def hf_snapshot_download(
                 )
 
         # From now on, etag and commit_hash are not None.
-        blob_path = os.path.join(storage_folder, "blobs", etag)
-        pointer_path = os.path.join(
-            storage_folder, "snapshots", commit_hash, relative_filename
-        )
+        blob_path = storage_folder / "blobs" / etag
+        pointer_path = storage_folder / "snapshots" / commit_hash / subfolder / filename
+        blob_path.parent.mkdir(parents=True, exist_ok=True)
+        pointer_path.parent.mkdir(parents=True,exist_ok=True)
 
-        os.makedirs(os.path.dirname(blob_path), exist_ok=True)
-        os.makedirs(os.path.dirname(pointer_path), exist_ok=True)
         # if passed revision is not identical to commit_hash
         # then revision has to be a branch name or tag name.
         # In that case store a ref.
-        _cache_commit_hash_for_specific_revision(storage_folder, revision, commit_hash)
+        _cache_commit_hash_for_specific_revision(storage_folder.as_posix(), revision, commit_hash)
 
-        if os.path.exists(pointer_path) and not force_download:
-            return pointer_path
+        if pointer_path.exists() and not force_download:
+            return pointer_path.as_posix()
 
-        if os.path.exists(blob_path) and not force_download:
+        if blob_path.exists() and not force_download:
             # we have the blob already, but not the pointer
             logger.info("creating pointer to %s from %s", blob_path, pointer_path)
-            _create_relative_symlink(blob_path, pointer_path, new_blob=False)
-            return pointer_path
+            _create_relative_symlink(blob_path.as_posix(), pointer_path.as_posix(), new_blob=False)
+            return pointer_path.as_posix()
 
         # Prevent parallel downloads of the same file with a lock.
-        lock_path = blob_path + ".lock"
-
-        # Some Windows versions do not allow for paths longer than 255 characters.
-        # In this case, we must specify it is an extended path by using the "\\?\" prefix.
-        if os.name == "nt" and len(os.path.abspath(lock_path)) > 255:
-            lock_path = "\\\\?\\" + os.path.abspath(lock_path)
-
-        if os.name == "nt" and len(os.path.abspath(blob_path)) > 255:
-            blob_path = "\\\\?\\" + os.path.abspath(blob_path)
+        lock_path = blob_path.with_suffix(".lock")
 
         with FileLock(lock_path):
             # If the download just completed while the lock was activated.
-            if os.path.exists(pointer_path) and not force_download:
+            if pointer_path.exists() and not force_download:
                 # Even if returning early like here, the lock will be released.
-                return pointer_path
+                return pointer_path.as_posix()
 
             if resume_download:
-                incomplete_path = blob_path + ".incomplete"
+                incomplete_path = blob_path.with_suffix(".incomplete")
 
                 @contextmanager
-                def _resumable_file_manager() -> "io.BufferedWriter":
+                def _resumable_file_manager() -> "Generator[io.BufferedWriter,None,None]":
                     with open(incomplete_path, "ab") as f:
                         yield f
 
                 temp_file_manager = _resumable_file_manager
-                if os.path.exists(incomplete_path):
-                    resume_size = os.stat(incomplete_path).st_size
-                else:
-                    resume_size = 0
+                resume_size = incomplete_path.stat().st_size if incomplete_path.exists() else 0
             else:
                 temp_file_manager = partial(
                     tempfile.NamedTemporaryFile, mode="wb", dir=cache_dir, delete=False
@@ -461,15 +449,14 @@ def hf_snapshot_download(
                 )
 
             logger.info("storing %s in cache at %s", url, blob_path)
-            os.replace(temp_file.name, blob_path)
+            Path(temp_file.name).replace(blob_path)
 
             logger.info("creating pointer to %s from %s", blob_path, pointer_path)
-            _create_relative_symlink(blob_path, pointer_path, new_blob=True)
+            _create_relative_symlink(blob_path.as_posix(), pointer_path.as_posix(), new_blob=True)
 
-        try:
-            os.remove(lock_path)
-        except OSError:
-            pass
+        with contextlib.suppress(OSError):
+            lock_path.unlink()
+
 
     @validate_hf_hub_args
     def snapshot_download(
@@ -506,9 +493,8 @@ def hf_snapshot_download(
                 f" {str(REPO_TYPES)}"
             )
 
-        storage_folder = os.path.join(
-            cache_dir, repo_folder_name(repo_id=repo_id, repo_type=repo_type)
-        )
+        storage_folder =  cache_dir / repo_folder_name(repo_id=repo_id, repo_type=repo_type)
+
 
         # TODO: remove these 4 lines in version 0.12
         #       Deprecated code to ensure backward compatibility.
@@ -526,14 +512,13 @@ def hf_snapshot_download(
                 commit_hash = revision
             else:
                 # retrieve commit_hash from file
-                ref_path = os.path.join(storage_folder, "refs", revision)
-                with open(ref_path) as f:
-                    commit_hash = f.read()
+                ref_path = storage_folder / "refs" / revision
+                commit_hash = ref_path.read_text()
 
-            snapshot_folder = os.path.join(storage_folder, "snapshots", commit_hash)
+            snapshot_folder = storage_folder / "snapshots" / commit_hash
 
-            if os.path.exists(snapshot_folder):
-                return snapshot_folder
+            if snapshot_folder:
+                return snapshot_folder.as_posix()
 
             raise ValueError(
                 "Cannot find an appropriate cached snapshot folder for the specified"
@@ -558,13 +543,13 @@ def hf_snapshot_download(
             )
         )
         commit_hash = repo_info.sha
-        snapshot_folder = os.path.join(storage_folder, "snapshots", commit_hash)
+        snapshot_folder = storage_folder / "snapshots" / commit_hash
         # if passed revision is not identical to commit_hash
         # then revision has to be a branch name or tag name.
         # In that case store a ref.
         if revision != commit_hash:
-            ref_path = os.path.join(storage_folder, "refs", revision)
-            os.makedirs(os.path.dirname(ref_path), exist_ok=True)
+            ref_path = storage_folder / "refs" / revision
+            ref_path.mkdir(parents=True,exist_ok=True)
             with open(ref_path, "w") as f:
                 f.write(commit_hash)
 
@@ -590,7 +575,7 @@ def hf_snapshot_download(
                 resume_download=resume_download,
                 use_auth_token=use_auth_token,
             ):
-                yield DownloadStatus(repo_file, status, 1)
+                yield DownloadStatus(repo_file, int(status), 1)
             yield DownloadStatus(repo_file, i + 1, len(filtered_repo_files))
 
     yield from snapshot_download(
