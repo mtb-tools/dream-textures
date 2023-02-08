@@ -119,7 +119,7 @@ def hf_list_installed_models(self) -> list[Model]:
 
             ref_path = storage_folder / "refs"
             for revision in ref_path.iterdir():
-                ref_path = storage_folder / "snapshots" / commit_hash
+                ref_path = storage_folder / "refs" / revision
                 if ref_path.exists():
                     commit_hash = ref_path.read_text()
                     snapshot_folder = storage_folder / "snapshots" / commit_hash
