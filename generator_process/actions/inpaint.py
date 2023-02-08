@@ -4,7 +4,7 @@ from contextlib import nullcontext
 from numpy.typing import NDArray
 import numpy as np
 import random
-from .prompt_to_image import Pipeline, Scheduler, Optimizations, StepPreviewMode, ImageGenerationResult, approximate_decoded_latents, _configure_model_padding
+from .prompt_to_image import Pipeline, Scheduler, Optimizations, StepPreviewMode, ImageGenerationResult, _configure_model_padding, model_snapshot_folder, load_pipe
 from .detect_seamless import SeamlessAxes
 
 def inpaint(
@@ -20,10 +20,10 @@ def inpaint(
     image: NDArray,
     fit: bool,
     strength: float,
-    prompt: str,
+    prompt: str | list[str],
     steps: int,
-    width: int,
-    height: int,
+    width: int | None,
+    height: int | None,
     seed: int,
 
     cfg_scale: float,
@@ -35,6 +35,10 @@ def inpaint(
     iterations: int,
 
     step_preview_mode: StepPreviewMode,
+
+    inpaint_mask_src: str,
+    text_mask: str,
+    text_mask_confidence: float,
 
     # Stability SDK
     key: str | None = None,
@@ -63,7 +67,7 @@ def inpaint(
                     negative_prompt: Optional[Union[str, List[str]]] = None,
                     num_images_per_prompt: Optional[int] = 1,
                     eta: float = 0.0,
-                    generator: Optional[torch.Generator] = None,
+                    generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
                     latents: Optional[torch.FloatTensor] = None,
                     output_type: Optional[str] = "pil",
                     return_dict: bool = True,
@@ -92,8 +96,7 @@ def inpaint(
                     )
 
                     # 4. Preprocess mask and image
-                    if isinstance(image, PIL.Image.Image) and isinstance(mask_image, PIL.Image.Image):
-                        mask, masked_image = diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint.prepare_mask_and_masked_image(image, mask_image)
+                    mask, masked_image = diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint.prepare_mask_and_masked_image(image, mask_image)
 
                     # 5. set timesteps
                     self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -158,32 +161,10 @@ def inpaint(
                             # compute the previous noisy sample x_t -> x_t-1
                             latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
+                            if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                                progress_bar.update()
                             # NOTE: Modified to yield the latents instead of calling a callback.
-                            match kwargs['step_preview_mode']:
-                                case StepPreviewMode.NONE:
-                                    yield ImageGenerationResult(
-                                        None,
-                                        generator.initial_seed(),
-                                        i,
-                                        False
-                                    )
-                                case StepPreviewMode.FAST:
-                                    yield ImageGenerationResult(
-                                        np.asarray(ImageOps.flip(Image.fromarray(approximate_decoded_latents(latents))).resize((width, height), Image.Resampling.NEAREST).convert('RGBA'), dtype=np.float32) / 255.,
-                                        generator.initial_seed(),
-                                        i,
-                                        False
-                                    )
-                                case StepPreviewMode.ACCURATE:
-                                    yield from [
-                                        ImageGenerationResult(
-                                            np.asarray(ImageOps.flip(image).convert('RGBA'), dtype=np.float32) / 255.,
-                                            generator.initial_seed(),
-                                            i,
-                                            False
-                                        )
-                                        for image in self.numpy_to_pil(self.decode_latents(latents))
-                                    ]
+                            yield ImageGenerationResult.step_preview(self, kwargs['step_preview_mode'], width, height, latents, generator, i)
 
                     # 11. Post-processing
                     image = self.decode_latents(latents)
@@ -193,60 +174,34 @@ def inpaint(
                     # image, has_nsfw_concept = self.run_safety_checker(image, device, text_embeddings.dtype)
 
                     # NOTE: Modified to yield the decoded image as a numpy array.
-                    yield from [
-                        ImageGenerationResult(
-                            np.asarray(ImageOps.flip(image).convert('RGBA'), dtype=np.float32) / 255.,
-                            generator.initial_seed(),
-                            num_inference_steps,
-                            True
-                        )
-                        for image in self.numpy_to_pil(image)
-                    ]
+                    yield ImageGenerationResult(
+                        [np.asarray(ImageOps.flip(image).convert('RGBA'), dtype=np.float32) / 255.
+                            for i, image in enumerate(self.numpy_to_pil(image))],
+                        [gen.initial_seed() for gen in generator] if isinstance(generator, list) else [generator.initial_seed()],
+                        num_inference_steps,
+                        True
+                    )
             
             if optimizations.cpu_only:
                 device = "cpu"
             else:
                 device = self.choose_device()
 
-            use_cpu_offload = optimizations.can_use("sequential_cpu_offload", device)
-
             # StableDiffusionPipeline w/ caching
-            if hasattr(self, "_cached_img2img_pipe") and self._cached_img2img_pipe[1] == model and use_cpu_offload == self._cached_img2img_pipe[2]:
-                pipe = self._cached_img2img_pipe[0]
-            else:
-                storage_folder = model
-                if os.path.exists(os.path.join(storage_folder, 'model_index.json')):
-                    snapshot_folder = storage_folder
-                else:
-                    revision = "main"
-                    ref_path = os.path.join(storage_folder, "refs", revision)
-                    with open(ref_path) as f:
-                        commit_hash = f.read()
-
-                    snapshot_folder = os.path.join(storage_folder, "snapshots", commit_hash)
-                pipe = GeneratorPipeline.from_pretrained(
-                    snapshot_folder,
-                    revision="fp16" if optimizations.can_use("half_precision", device) else None,
-                    torch_dtype=torch.float16 if optimizations.can_use("half_precision", device) else torch.float32,
-                )
-                pipe = pipe.to(device)
-                setattr(self, "_cached_img2img_pipe", (pipe, model, use_cpu_offload, snapshot_folder))
-
-            # Scheduler
-            is_stable_diffusion_2 = 'stabilityai--stable-diffusion-2' in model
-            pipe.scheduler = scheduler.create(pipe, {
-                'model_path': self._cached_img2img_pipe[3],
-                'subfolder': 'scheduler',
-            } if is_stable_diffusion_2 else None)
+            pipe = load_pipe(self, "inpaint", GeneratorPipeline, model, optimizations, scheduler, device)
 
             # Optimizations
             pipe = optimizations.apply(pipe, device)
 
             # RNG
-            generator = torch.Generator(device="cpu" if device == "mps" else device) # MPS does not support the `Generator` API
-            if seed is None:
-                seed = random.randrange(0, np.iinfo(np.uint32).max)
-            generator = generator.manual_seed(seed)
+            batch_size = len(prompt) if isinstance(prompt, list) else 1
+            generator = []
+            for _ in range(batch_size):
+                gen = torch.Generator(device="cpu" if device in ("mps", "privateuseone") else device) # MPS and DML do not support the `Generator` API
+                generator.append(gen.manual_seed(random.randrange(0, np.iinfo(np.uint32).max) if seed is None else seed))
+            if batch_size == 1:
+                # Some schedulers don't handle a list of generators: https://github.com/huggingface/diffusers/issues/1909
+                generator = generator[0]
 
             # Init Image
             init_image = Image.fromarray(image)
@@ -258,12 +213,24 @@ def inpaint(
             _configure_model_padding(pipe.vae, seamless_axes)
 
             # Inference
-            with (torch.inference_mode() if device != 'mps' else nullcontext()), \
+            with (torch.inference_mode() if device not in ('mps', "privateuseone") else nullcontext()), \
                     (torch.autocast(device) if optimizations.can_use("amp", device) else nullcontext()):
+                    match inpaint_mask_src:
+                        case 'alpha':
+                            mask_image = ImageOps.invert(init_image.getchannel('A'))
+                        case 'prompt':
+                            from transformers import AutoProcessor, CLIPSegForImageSegmentation
+
+                            processor = AutoProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
+                            clipseg = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined")
+                            inputs = processor(text=[text_mask], images=[init_image.convert('RGB')], return_tensors="pt", padding=True)
+                            outputs = clipseg(**inputs)
+                            mask_image = Image.fromarray(np.uint8((1 - torch.sigmoid(outputs.logits).lt(text_mask_confidence).int().detach().numpy()) * 255), 'L').resize(init_image.size)
+
                     yield from pipe(
                         prompt=prompt,
-                        image=init_image.convert('RGB'),
-                        mask_image=ImageOps.invert(init_image.getchannel('A')),
+                        image=[init_image.convert('RGB')] * batch_size,
+                        mask_image=[mask_image] * batch_size,
                         strength=strength,
                         height=init_image.size[1] if fit else height,
                         width=init_image.size[0] if fit else width,
@@ -297,8 +264,8 @@ def inpaint(
 
             answers = client.generate(
                 prompt=prompt,
-                width=width,
-                height=height,
+                width=width or 512,
+                height=height or 512,
                 cfg_scale=cfg_scale,
                 sampler=scheduler.stability_sdk(),
                 steps=steps,
@@ -314,8 +281,8 @@ def inpaint(
                     if artifact.type == stability_sdk.interfaces.gooseai.generation.generation_pb2.ARTIFACT_IMAGE:
                         image = Image.open(io.BytesIO(artifact.binary))
                         yield ImageGenerationResult(
-                            np.asarray(ImageOps.flip(image).convert('RGBA'), dtype=np.float32) / 255.,
-                            seed,
+                            [np.asarray(ImageOps.flip(image).convert('RGBA'), dtype=np.float32) / 255.],
+                            [seed],
                             steps,
                             True
                         )

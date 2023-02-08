@@ -3,9 +3,11 @@ from bpy.props import CollectionProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 import os
 import webbrowser
+import importlib.util
+import site
 
 from .absolute_path import absolute_path
-from .operators.install_dependencies import InstallDependencies
+from .operators.install_dependencies import InstallDependencies, UninstallDependencies
 from .operators.open_latest_version import OpenLatestVersion
 from .ui.presets import RestoreDefaultPresets, default_presets_missing
 from .generator_process import Generator
@@ -15,14 +17,16 @@ from .generator_process.actions.convert_original_stable_diffusion_to_diffusers i
 
 is_downloading = False
 
-class OpenHuggingFace(bpy.types.Operator):
-    bl_idname = "dream_textures.open_hugging_face"
+class OpenURL(bpy.types.Operator):
+    bl_idname = "dream_textures.open_url"
     bl_label = "Get Access Token"
     bl_description = ("Opens huggingface.co to the tokens page")
     bl_options = {"REGISTER", "INTERNAL"}
 
+    url: bpy.props.StringProperty(name="URL")
+
     def execute(self, context):
-        webbrowser.open("https://huggingface.co/settings/tokens")
+        webbrowser.open(self.url)
         return {"FINISHED"}
 
 _model_config_options = [(m.name, m.value, '') for m in ModelConfig]
@@ -48,28 +52,12 @@ class ImportWeights(bpy.types.Operator, ImportHelper):
         try:
             Generator.shared().convert_original_stable_diffusion_to_diffusers(self.filepath, ModelConfig[self.model_config]).result()
         except Exception as e:
+            self.report({"ERROR"}, """Model conversion failed. Make sure you select the correct model configuration in the sidebar.
+Press 'N' or click the gear icon in the top right of the file selection popup to reveal the sidebar.""")
             self.report({"ERROR"}, str(e))
         
         set_model_list('installed_models', Generator.shared().hf_list_installed_models().result())
 
-        return {"FINISHED"}
-
-class OpenContributors(bpy.types.Operator):
-    bl_idname = "dream_textures.open_contributors"
-    bl_label = "See All Contributors"
-
-    def execute(self, context):
-        webbrowser.open("https://github.com/carson-katri/dream-textures/graphs/contributors")
-        return {"FINISHED"}
-
-class OpenDreamStudio(bpy.types.Operator):
-    bl_idname = "dream_textures.open_dream_studio"
-    bl_label = "Find Your Key"
-    bl_description = ("Opens DreamStudio to the API key tab.")
-    bl_options = {"REGISTER", "INTERNAL"}
-
-    def execute(self, context):
-        webbrowser.open("https://beta.dreamstudio.ai/membership?tab=apiKeys")
         return {"FINISHED"}
 
 class Model(bpy.types.PropertyGroup):
@@ -96,7 +84,9 @@ class PREFERENCES_UL_ModelList(bpy.types.UIList):
             split.label(text=str(item.likes), icon="HEART")
         if ModelType[item.model_type] != ModelType.UNKNOWN:
             split.label(text=item.model_type.replace('_', ' ').title())
-        layout.operator(InstallModel.bl_idname, text="", icon="FILE_FOLDER" if is_installed else "IMPORT").model = item.model
+        install_model = layout.operator(InstallModel.bl_idname, text="", icon="FILE_FOLDER" if is_installed else "IMPORT")
+        install_model.model = item.model
+        install_model.prefer_fp16_revision = data.prefer_fp16_revision
 
 @staticmethod
 def set_model_list(model_list: str, models: list):
@@ -128,6 +118,7 @@ class InstallModel(bpy.types.Operator):
     bl_options = {"REGISTER", "INTERNAL"}
 
     model: StringProperty(name="Model ID")
+    prefer_fp16_revision: bpy.props.BoolProperty(name="", default=True)
 
     def execute(self, context):
         if os.path.exists(self.model):
@@ -135,7 +126,7 @@ class InstallModel(bpy.types.Operator):
         else:
             global is_downloading
             is_downloading = True
-            f = Generator.shared().hf_snapshot_download(self.model, bpy.context.preferences.addons[__package__].preferences.hf_token)
+            f = Generator.shared().hf_snapshot_download(self.model, bpy.context.preferences.addons[__package__].preferences.hf_token, "fp16" if self.prefer_fp16_revision else None)
             def on_progress(_, response: DownloadStatus):
                 bpy.context.preferences.addons[__package__].preferences.download_file = response.file
                 bpy.context.preferences.addons[__package__].preferences.download_progress = int((response.index / response.total) * 100)
@@ -145,6 +136,7 @@ class InstallModel(bpy.types.Operator):
                 set_model_list('installed_models', Generator.shared().hf_list_installed_models().result())
             def on_exception(_, exception):
                 self.report({"ERROR"}, str(exception))
+                raise exception
             f.add_response_callback(on_progress)
             f.add_done_callback(on_done)
             f.add_exception_callback(on_exception)
@@ -153,7 +145,7 @@ class InstallModel(bpy.types.Operator):
 def _model_search(self, context):
     def on_done(future):
         set_model_list('model_results', future.result())
-    Generator.shared().hf_list_models(self.model_query).add_done_callback(on_done)
+    Generator.shared().hf_list_models(self.model_query, self.hf_token).add_done_callback(on_done)
 
 def _update_ui(self, context):
     if hasattr(context.area, "regions"):
@@ -161,6 +153,16 @@ def _update_ui(self, context):
             if region.type == "UI":
                 region.tag_redraw()
     return None
+
+def _template_model_download_progress(context, layout):
+    global is_downloading
+    preferences = context.preferences.addons[StableDiffusionPreferences.bl_idname].preferences
+    if is_downloading:
+        progress_col = layout.column()
+        progress_col.label(text=f"Downloading {preferences.download_file}")
+        progress_col.prop(preferences, "download_progress", slider=True)
+        progress_col.enabled = False
+    return is_downloading
 
 class StableDiffusionPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
@@ -171,6 +173,7 @@ class StableDiffusionPreferences(bpy.types.AddonPreferences):
     model_results: CollectionProperty(type=Model)
     active_model_result: bpy.props.IntProperty(name="Active Model", default=0)
     hf_token: StringProperty(name="HuggingFace Token")
+    prefer_fp16_revision: bpy.props.BoolProperty(name="Prefer Half Precision Weights", description="Download fp16 weights if available for smaller file size. If you run with 'Half Precision' disabled, you should not use this setting", default=True)
 
     installed_models: CollectionProperty(type=Model)
     active_installed_model: bpy.props.IntProperty(name="Active Model", default=0)
@@ -198,16 +201,32 @@ class StableDiffusionPreferences(bpy.types.AddonPreferences):
             has_local = Pipeline.local_available()
 
             if has_local:
-                if is_downloading:
-                    progress_col = layout.column()
-                    progress_col.label(text=f"Downloading {self.download_file}")
-                    progress_col.prop(self, "download_progress", slider=True)
-                    progress_col.enabled = False
-                else:
+                if not _template_model_download_progress(context, layout):
+                    conflicting_packages = ["wandb", "k_diffusion"]
+                    conflicting_package_specs = {}
+                    for package in conflicting_packages:
+                        spec = importlib.util.find_spec(package)
+                        if spec is not None:
+                            conflicting_package_specs[package] = spec
+                    if len(conflicting_package_specs) > 0:
+                        conflicts_box = layout.box()
+                        conflicts_box.label(text="WARNING", icon="ERROR")
+                        conflicts_box.label(text=f"The following packages conflict with Dream Textures: {', '.join(conflicting_packages)}")
+                        conflicts_box.label(text=f"You may need to run Blender as an administrator to remove these packages")
+                        conflicts_box.operator(UninstallDependencies.bl_idname, text="Uninstall Conflicting Packages", icon="CANCEL").conflicts = ' '.join(conflicting_packages)
+                        conflicts_box.label(text=f"If the button above fails, you can remove the following folders manually:")
+                        for package in conflicting_packages:
+                            if package not in conflicting_package_specs:
+                                continue
+                            location = conflicting_package_specs[package].submodule_search_locations[0]
+                            conflicts_box.operator(OpenURL.bl_idname, text=f"Open '{location}'").url = f"file://{location}"
+
                     if not weights_installed:
                         default_weights_box = layout.box()
                         default_weights_box.label(text="You need to download at least one model.")
-                        default_weights_box.operator(InstallModel.bl_idname, text="Download Stable Diffusion v2.1 (Recommended)", icon="IMPORT").model = "stabilityai/stable-diffusion-2-1"
+                        install_model = default_weights_box.operator(InstallModel.bl_idname, text="Download Stable Diffusion v2.1 (Recommended)", icon="IMPORT")
+                        install_model.model = "stabilityai/stable-diffusion-2-1"
+                        install_model.prefer_fp16_revision = self.prefer_fp16_revision
 
                     search_box = layout.box()
                     search_box.label(text="Find Models", icon="SETTINGS")
@@ -222,7 +241,9 @@ class StableDiffusionPreferences(bpy.types.AddonPreferences):
 
                     auth_row = search_box.row()
                     auth_row.prop(self, "hf_token", text="Token")
-                    auth_row.operator(OpenHuggingFace.bl_idname, text="Get Your Token", icon="KEYINGSET")
+                    auth_row.operator(OpenURL.bl_idname, text="Get Your Token", icon="KEYINGSET").url = "https://huggingface.co/settings/tokens"
+                    
+                    search_box.prop(self, "prefer_fp16_revision")
 
                 layout.template_list(PREFERENCES_UL_ModelList.__name__, "dream_textures_installed_models", self, "installed_models", self, "active_installed_model")
                 layout.operator(ImportWeights.bl_idname, icon='IMPORT')
@@ -232,7 +253,7 @@ class StableDiffusionPreferences(bpy.types.AddonPreferences):
             dream_studio_box.label(text=f"Link to your DreamStudio account to run in the cloud{' instead of locally.' if has_local else '.'}")
             key_row = dream_studio_box.row()
             key_row.prop(self, "dream_studio_key", text="Key")
-            key_row.operator(OpenDreamStudio.bl_idname, text="Find Your Key", icon="KEYINGSET")
+            key_row.operator(OpenURL.bl_idname, text="Find Your Key", icon="KEYINGSET").url = "https://beta.dreamstudio.ai/membership?tab=apiKeys"
 
             if weights_installed or len(self.dream_studio_key) > 0:
                 complete_box = layout.box()
@@ -258,15 +279,18 @@ class StableDiffusionPreferences(bpy.types.AddonPreferences):
         contributors_box = layout.box()
         contributors_box.label(text="Contributors", icon="COMMUNITY")
         contributors_box.label(text="Dream Textures is made possible by the contributors on GitHub.")
-        contributors_box.operator(OpenContributors.bl_idname, icon="URL")
+        contributors_box.operator(OpenURL.bl_idname, text="See All Contributors", icon="URL").url = "https://github.com/carson-katri/dream-textures/graphs/contributors"
 
         if context.preferences.view.show_developer_ui: # If 'Developer Extras' is enabled, show addon development tools
             developer_box = layout.box()
             developer_box.label(text="Development Tools", icon="CONSOLE")
-            developer_box.label(text="This section is for addon development only. You are seeing this because you have 'Developer Extras' enabled.")
-            developer_box.label(text="Do not use any operators in this section unless you are setting up a development environment.")
+            warn_box = developer_box.box()
+            warn_box.label(text="WARNING", icon="ERROR")
+            warn_box.label(text="This section is for addon development only.")
+            warn_box.label(text="Do not use any operators in this section unless you are setting up a development environment.")
             if has_dependencies:
                 warn_box = developer_box.box()
                 warn_box.label(text="Dependencies already installed. Only install below if you developing the addon", icon="CHECKMARK")
             developer_box.prop(context.scene, 'dream_textures_requirements_path')
+            developer_box.operator_context = 'INVOKE_DEFAULT'
             developer_box.operator(InstallDependencies.bl_idname, icon="CONSOLE")

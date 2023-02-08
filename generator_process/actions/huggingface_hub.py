@@ -16,10 +16,12 @@ import requests
 import json
 import enum
 
+
 class ModelType(enum.IntEnum):
     """
     Inferred model type from the U-Net `in_channels`.
     """
+
     UNKNOWN = 0
     PROMPT_TO_IMAGE = 4
     DEPTH = 5
@@ -30,6 +32,24 @@ class ModelType(enum.IntEnum):
     def _missing_(cls, _):
         return cls.UNKNOWN
 
+    def recommended_model(self) -> str:
+        """Provides a recommended model for a given task.
+
+        This method has a bias towards the latest version of official Stability AI models.
+        """
+        match self:
+            case ModelType.PROMPT_TO_IMAGE:
+                return "stabilityai/stable-diffusion-2-1"
+            case ModelType.DEPTH:
+                return "stabilityai/stable-diffusion-2-depth"
+            case ModelType.UPSCALING:
+                return "stabilityai/stable-diffusion-x4-upscaler"
+            case ModelType.INPAINTING:
+                return "stabilityai/stable-diffusion-2-inpainting"
+            case _:
+                return "stabilityai/stable-diffusion-2-1"
+
+
 @dataclass
 class Model:
     id: str
@@ -39,9 +59,11 @@ class Model:
     downloads: int
     model_type: ModelType
 
+
 def hf_list_models(
     self,
-    query: str
+    query: str,
+    token: str,
 ) -> list[Model]:
     from huggingface_hub import HfApi, ModelFilter
 
@@ -52,50 +74,74 @@ def hf_list_models(
         setattr(self, "huggingface_hub_api", api)
 
     filter = ModelFilter(tags="diffusers", task="text-to-image")
-    models = api.list_models(
-        filter=filter,
-        search=query
-    )
+    models = api.list_models(filter=filter, search=query, use_auth_token=token)
+    return [
+        Model(
+            m.modelId,
+            m.author or "",
+            m.tags,
+            m.likes if hasattr(m, "likes") else 0,
+            getattr(m, "downloads", -1),
+            ModelType.UNKNOWN,
+        )
+        for m in models
+        if m.modelId is not None
+        and m.tags is not None
+        and "diffusers" in (m.tags or {})
+    ]
 
-    return list(map(lambda m: Model(m.modelId, m.author, m.tags, m.likes, getattr(m, "downloads", -1), ModelType.UNKNOWN), models))
 
 def hf_list_installed_models(self) -> list[Model]:
     from diffusers.utils import DIFFUSERS_CACHE
+
     DIFFUSERS_CACHE = Path(DIFFUSERS_CACHE)
 
     if not DIFFUSERS_CACHE.exists():
         return []
+
+    def detect_model_type(snapshot_folder):
+        unet_config = os.path.join(snapshot_folder, "unet", "config.json")
+        if os.path.exists(unet_config):
+            with open(unet_config, "r") as f:
+                return ModelType(json.load(f)["in_channels"])
+        else:
+            return ModelType.UNKNOWN
+
     def _map_model(file):
         storage_folder = DIFFUSERS_CACHE / file
         snapshot_folder = None
-        if ((storage_folder / 'model_index.json').exists()):
-            snapshot_folder = storage_folder
-        else:
-            revision = "main"
-            ref_path = storage_folder / "refs" / revision
-            if (ref_path.exists()):
-                commit_hash = ref_path.read_text()
-                snapshot_folder = storage_folder / "snapshots" / commit_hash
-            else:
-                print(f"Could not find {revision} in {ref_path.parent.as_posix()}")
-                print(f"Candidates: {[x.stem for x in ref_path.parent.iterdir()]}")
         model_type = ModelType.UNKNOWN
 
-        if (snapshot_folder):
-            with contextlib.suppress(Exception):
-                with open(snapshot_folder / 'unet' / 'config.json', 'r') as f:
-                    model_type = ModelType(json.load(f)['in_channels'])
+        if (storage_folder / "model_index.json").exists():
+            snapshot_folder = storage_folder
+            model_type = detect_model_type(snapshot_folder)
+        else:
 
-        return Model(
-            storage_folder.as_posix(),
-            "",
-            [],
-            -1,
-            -1,
-            model_type
-        )
+            ref_path = storage_folder / "refs"
+            for revision in ref_path.iterdir():
+                ref_path = storage_folder / "snapshots" / commit_hash
+                if ref_path.exists():
+                    commit_hash = ref_path.read_text()
+                    snapshot_folder = storage_folder / "snapshots" / commit_hash
+                    if (
+                        detected_type := detect_model_type(snapshot_folder)
+                    ) != ModelType.UNKNOWN:
+                        model_type = detected_type
+                        break
+            # else:
+            #     print(f"Could not find {revision} in {ref_path.parent.as_posix()}")
+            #     print(f"Candidates: {[x.stem for x in ref_path.parent.iterdir()]}")
+        model_type = ModelType.UNKNOWN
+
+        if snapshot_folder:
+            with contextlib.suppress(Exception):
+                with open(snapshot_folder / "unet" / "config.json", "r") as f:
+                    model_type = ModelType(json.load(f)["in_channels"])
+
+        return Model(storage_folder.as_posix(), "", [], -1, -1, model_type)
 
     return [_map_model(file) for file in DIFFUSERS_CACHE.iterdir() if file.is_dir()]
+
 
 @dataclass
 class DownloadStatus:
@@ -103,10 +149,9 @@ class DownloadStatus:
     index: int
     total: int
 
+
 def hf_snapshot_download(
-    self,
-    model: str,
-    token: str
+    self, model: str, token: str, revision: str | None = None
 ) -> Generator[DownloadStatus, None, None]:
     from filelock import FileLock
     from huggingface_hub.constants import (
@@ -115,30 +160,65 @@ def hf_snapshot_download(
         HUGGINGFACE_HUB_CACHE,
         REPO_TYPES,
     )
-    from huggingface_hub.file_download import REGEX_COMMIT_HASH, repo_folder_name, hf_hub_url, _request_wrapper, hf_raise_for_status, logger, cached_download, build_hf_headers, get_hf_file_metadata, _cache_commit_hash_for_specific_revision, OfflineModeIsEnabled, _create_relative_symlink
+    from huggingface_hub.file_download import (
+        REGEX_COMMIT_HASH,
+        repo_folder_name,
+        hf_hub_url,
+        _request_wrapper,
+        hf_raise_for_status,
+        logger,
+        cached_download,
+        build_hf_headers,
+        get_hf_file_metadata,
+        _cache_commit_hash_for_specific_revision,
+        OfflineModeIsEnabled,
+        _create_relative_symlink,
+    )
     from huggingface_hub.hf_api import HfApi
-    from huggingface_hub.utils import filter_repo_objects, validate_hf_hub_args, tqdm, logging, EntryNotFoundError, LocalEntryNotFoundError
+    from huggingface_hub.utils import (
+        filter_repo_objects,
+        validate_hf_hub_args,
+        tqdm,
+        logging,
+        EntryNotFoundError,
+        LocalEntryNotFoundError,
+        RevisionNotFoundError,
+    )
 
     from diffusers import StableDiffusionPipeline
-    from diffusers.utils import DIFFUSERS_CACHE, WEIGHTS_NAME, CONFIG_NAME, ONNX_WEIGHTS_NAME
+    from diffusers.utils import (
+        DIFFUSERS_CACHE,
+        WEIGHTS_NAME,
+        CONFIG_NAME,
+        ONNX_WEIGHTS_NAME,
+    )
     from diffusers.schedulers.scheduling_utils import SCHEDULER_CONFIG_NAME
-    from diffusers.hub_utils import http_user_agent
-    config_dict = StableDiffusionPipeline.get_config_dict(
+    from diffusers.utils.hub_utils import http_user_agent
+
+    config_dict = StableDiffusionPipeline.load_config(
         model,
         cache_dir=DIFFUSERS_CACHE,
         resume_download=True,
         force_download=False,
-        use_auth_token=token
+        use_auth_token=token,
     )
     # make sure we only download sub-folders and `diffusers` filenames
     folder_names = [k for k in config_dict.keys() if not k.startswith("_")]
     allow_patterns = [os.path.join(k, "*") for k in folder_names]
-    allow_patterns += [WEIGHTS_NAME, SCHEDULER_CONFIG_NAME, CONFIG_NAME, ONNX_WEIGHTS_NAME, StableDiffusionPipeline.config_name]
+    allow_patterns += [
+        WEIGHTS_NAME,
+        SCHEDULER_CONFIG_NAME,
+        CONFIG_NAME,
+        ONNX_WEIGHTS_NAME,
+        StableDiffusionPipeline.config_name,
+    ]
 
-    # make sure we don't download flax weights
-    ignore_patterns = "*.msgpack"
+    # make sure we don't download flax, safetensors, or ckpt weights.
+    ignore_patterns = ["*.msgpack", "*.safetensors", "*.ckpt"]
 
-    requested_pipeline_class = config_dict.get("_class_name", StableDiffusionPipeline.__name__)
+    requested_pipeline_class = config_dict.get(
+        "_class_name", StableDiffusionPipeline.__name__
+    )
     user_agent = {"pipeline_class": requested_pipeline_class}
     user_agent = http_user_agent(user_agent)
 
@@ -256,13 +336,17 @@ def hf_snapshot_download(
                 f" {str(REPO_TYPES)}"
             )
 
-        storage_folder = cache_dir / repo_folder_name(repo_id=repo_id, repo_type=repo_type)
-        storage_folder.mkdir(parents=True,exist_ok=True)
+        storage_folder = cache_dir / repo_folder_name(
+            repo_id=repo_id, repo_type=repo_type
+        )
+        storage_folder.mkdir(parents=True, exist_ok=True)
 
         # if user provides a commit_hash and they already have the file on disk,
         # shortcut everything.
         if REGEX_COMMIT_HASH.match(revision):
-            pointer_path = storage_folder / "snapshots" / revision / subfolder / filename
+            pointer_path = (
+                storage_folder / "snapshots" / revision / subfolder / filename
+            )
 
             if (pointer_path).exists():
                 return pointer_path.as_posix()
@@ -368,7 +452,9 @@ def hf_snapshot_download(
                 ref_path = storage_folder / "refs" / revision
                 commit_hash = ref_path.read_text()
 
-            pointer_path = storage_folder / "snapshots" / commit_hash / subfolder / filename
+            pointer_path = (
+                storage_folder / "snapshots" / commit_hash / subfolder / filename
+            )
             if pointer_path.exists():
                 return pointer_path.as_posix()
 
@@ -394,12 +480,14 @@ def hf_snapshot_download(
         blob_path = storage_folder / "blobs" / etag
         pointer_path = storage_folder / "snapshots" / commit_hash / subfolder / filename
         blob_path.parent.mkdir(parents=True, exist_ok=True)
-        pointer_path.parent.mkdir(parents=True,exist_ok=True)
+        pointer_path.parent.mkdir(parents=True, exist_ok=True)
 
         # if passed revision is not identical to commit_hash
         # then revision has to be a branch name or tag name.
         # In that case store a ref.
-        _cache_commit_hash_for_specific_revision(storage_folder.as_posix(), revision, commit_hash)
+        _cache_commit_hash_for_specific_revision(
+            storage_folder.as_posix(), revision, commit_hash
+        )
 
         if pointer_path.exists() and not force_download:
             return pointer_path.as_posix()
@@ -407,7 +495,9 @@ def hf_snapshot_download(
         if blob_path.exists() and not force_download:
             # we have the blob already, but not the pointer
             logger.info("creating pointer to %s from %s", blob_path, pointer_path)
-            _create_relative_symlink(blob_path.as_posix(), pointer_path.as_posix(), new_blob=False)
+            _create_relative_symlink(
+                blob_path.as_posix(), pointer_path.as_posix(), new_blob=False
+            )
             return pointer_path.as_posix()
 
         # Prevent parallel downloads of the same file with a lock.
@@ -428,7 +518,9 @@ def hf_snapshot_download(
                         yield f
 
                 temp_file_manager = _resumable_file_manager
-                resume_size = incomplete_path.stat().st_size if incomplete_path.exists() else 0
+                resume_size = (
+                    incomplete_path.stat().st_size if incomplete_path.exists() else 0
+                )
             else:
                 temp_file_manager = partial(
                     tempfile.NamedTemporaryFile, mode="wb", dir=cache_dir, delete=False
@@ -452,11 +544,12 @@ def hf_snapshot_download(
             Path(temp_file.name).replace(blob_path)
 
             logger.info("creating pointer to %s from %s", blob_path, pointer_path)
-            _create_relative_symlink(blob_path.as_posix(), pointer_path.as_posix(), new_blob=True)
+            _create_relative_symlink(
+                blob_path.as_posix(), pointer_path.as_posix(), new_blob=True
+            )
 
         with contextlib.suppress(OSError):
             lock_path.unlink()
-
 
     @validate_hf_hub_args
     def snapshot_download(
@@ -493,8 +586,9 @@ def hf_snapshot_download(
                 f" {str(REPO_TYPES)}"
             )
 
-        storage_folder =  cache_dir / repo_folder_name(repo_id=repo_id, repo_type=repo_type)
-
+        storage_folder = cache_dir / repo_folder_name(
+            repo_id=repo_id, repo_type=repo_type
+        )
 
         # TODO: remove these 4 lines in version 0.12
         #       Deprecated code to ensure backward compatibility.
@@ -549,7 +643,7 @@ def hf_snapshot_download(
         # In that case store a ref.
         if revision != commit_hash:
             ref_path = storage_folder / "refs" / revision
-            ref_path.mkdir(parents=True,exist_ok=True)
+            ref_path.mkdir(parents=True, exist_ok=True)
             with open(ref_path, "w") as f:
                 f.write(commit_hash)
 
@@ -578,12 +672,24 @@ def hf_snapshot_download(
                 yield DownloadStatus(repo_file, int(status), 1)
             yield DownloadStatus(repo_file, i + 1, len(filtered_repo_files))
 
-    yield from snapshot_download(
-        model,
-        cache_dir=DIFFUSERS_CACHE,
-        resume_download=True,
-        use_auth_token=token,
-        allow_patterns=allow_patterns,
-        ignore_patterns=ignore_patterns,
-        user_agent=user_agent,
-    )
+    try:
+        yield from snapshot_download(
+            model,
+            revision=revision,
+            cache_dir=DIFFUSERS_CACHE,
+            resume_download=True,
+            use_auth_token=token,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            user_agent=user_agent,
+        )
+    except RevisionNotFoundError:
+        yield from snapshot_download(
+            model,
+            cache_dir=DIFFUSERS_CACHE,
+            resume_download=True,
+            use_auth_token=token,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+            user_agent=user_agent,
+        )

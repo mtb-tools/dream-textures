@@ -1,15 +1,15 @@
 from typing import Tuple, Generator
 from numpy.typing import NDArray
 import numpy as np
-from .prompt_to_image import ImageGenerationResult
+from .prompt_to_image import ImageGenerationResult, StepPreviewMode
 
 def outpaint(
     self,
 
     image: NDArray,
 
-    width: int,
-    height: int,
+    width: int | None,
+    height: int | None,
 
     outpaint_origin: Tuple[int, int],
 
@@ -18,6 +18,8 @@ def outpaint(
     from PIL import Image, ImageOps
 
     init_image = Image.fromarray(image)
+    width = width or 512
+    height = height or 512
     
     if outpaint_origin[0] > init_image.size[0] or outpaint_origin[0] < -width:
         raise ValueError(f"Outpaint origin X ({outpaint_origin[0]}) must be between {-width} and {init_image.size[0]}")
@@ -53,17 +55,14 @@ def outpaint(
     )
 
     def process(step: ImageGenerationResult):
-        image = outpaint_bounds.copy()
-        image.paste(
-            ImageOps.flip(Image.fromarray((step.image * 255.).astype(np.uint8))),
-            offset_origin
-        )
-        return ImageGenerationResult(
-            np.asarray(ImageOps.flip(image).convert('RGBA'), dtype=np.float32) / 255.,
-            step.seed,
-            step.step,
-            step.final
-        )
+        for i, result_image in enumerate(step.images):
+            image = outpaint_bounds.copy()
+            image.paste(
+                ImageOps.flip(Image.fromarray((result_image * 255.).astype(np.uint8))),
+                offset_origin
+            )
+            step.images[i] = np.asarray(ImageOps.flip(image).convert('RGBA'), dtype=np.float32) / 255.
+        return step
 
     for step in self.inpaint(
         image=np.array(inpaint_tile),

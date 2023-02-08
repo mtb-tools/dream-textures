@@ -15,7 +15,7 @@ bl_info = {
     "name": "Dream Textures",
     "author": "Dream Textures contributors",
     "description": "Use Stable Diffusion to generate unique textures straight from the shader editor.",
-    "blender": (3, 0, 0),
+    "blender": (3, 1, 0),
     "version": (0, 0, 9),
     "location": "Image Editor -> Sidebar -> Dream",
     "category": "Paint"
@@ -52,6 +52,7 @@ if current_process().name != "__actor__":
         ('requirements/win-linux-cuda.txt', 'Linux/Windows (CUDA)', 'Linux or Windows with NVIDIA GPU'),
         ('requirements/mac-mps-cpu.txt', 'Apple Silicon', 'Apple M1/M2'),
         ('requirements/linux-rocm.txt', 'Linux (AMD)', 'Linux with AMD GPU'),
+        ('requirements/win-dml.txt', 'Windows (DirectML)', 'Windows with DirectX 12 GPU'),
         ('requirements/dreamstudio.txt', 'DreamStudio', 'Cloud Compute Service')
     )
 
@@ -99,6 +100,7 @@ if current_process().name != "__actor__":
         
         bpy.types.Scene.dream_textures_project_prompt = PointerProperty(type=DreamPrompt)
         bpy.types.Scene.dream_textures_project_framebuffer_arguments = EnumProperty(name="Inputs", items=framebuffer_arguments)
+        bpy.types.Scene.dream_textures_project_bake = BoolProperty(name="Bake", default=False, description="Re-maps the generated texture onto the specified UV map")
 
         for cls in CLASSES:
             bpy.utils.register_class(cls)
