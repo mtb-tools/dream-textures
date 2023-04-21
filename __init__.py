@@ -16,7 +16,7 @@ bl_info = {
     "author": "Dream Textures contributors",
     "description": "Use Stable Diffusion to generate unique textures straight from the shader editor.",
     "blender": (3, 1, 0),
-    "version": (0, 0, 9),
+    "version": (0, 2, 0),
     "location": "Image Editor -> Sidebar -> Dream",
     "category": "Paint"
 }
@@ -25,7 +25,7 @@ from multiprocessing import current_process
 
 if current_process().name != "__actor__":
     import bpy
-    from bpy.props import IntProperty, PointerProperty, EnumProperty, BoolProperty, CollectionProperty, FloatProperty
+    from bpy.props import IntProperty, PointerProperty, EnumProperty, BoolProperty, CollectionProperty
     import sys
     import os
 
@@ -45,8 +45,9 @@ if current_process().name != "__actor__":
     from .operators.dream_texture import DreamTexture, kill_generator
     from .property_groups.dream_prompt import DreamPrompt
     from .property_groups.seamless_result import SeamlessResult
-    from .preferences import StableDiffusionPreferences
     from .ui.presets import register_default_presets
+    
+    from . import engine
 
     requirements_path_items = (
         ('requirements/win-linux-cuda.txt', 'Linux/Windows (CUDA)', 'Linux or Windows with NVIDIA GPU'),
@@ -65,10 +66,10 @@ if current_process().name != "__actor__":
 
         bpy.types.Scene.dream_textures_requirements_path = EnumProperty(name="Platform", items=requirements_path_items, description="Specifies which set of dependencies to install", default='requirements/mac-mps-cpu.txt' if sys.platform == 'darwin' else 'requirements/win-linux-cuda.txt')
 
-        StableDiffusionPreferences.__annotations__['history'] = CollectionProperty(type=DreamPrompt)
-
         for cls in PREFERENCE_CLASSES:
             bpy.utils.register_class(cls)
+        
+        bpy.types.Scene.dream_textures_history = CollectionProperty(type=DreamPrompt)
 
         check_for_updates()
 
@@ -79,7 +80,7 @@ if current_process().name != "__actor__":
         bpy.types.Scene.init_depth = PointerProperty(name="Init Depth", type=bpy.types.Image, description="Use an existing depth map. Leave blank to generate one from the init image")
         bpy.types.Scene.seamless_result = PointerProperty(type=SeamlessResult)
         def get_selection_preview(self):
-            history = bpy.context.preferences.addons[StableDiffusionPreferences.bl_idname].preferences.history
+            history = bpy.context.scene.dream_textures_history
             if self.dream_textures_history_selection > 0 and self.dream_textures_history_selection < len(history):
                 return history[self.dream_textures_history_selection].generate_prompt()
             return ""
@@ -87,6 +88,7 @@ if current_process().name != "__actor__":
         bpy.types.Scene.dream_textures_history_selection_preview = bpy.props.StringProperty(name="", default="", get=get_selection_preview, set=lambda _, __: None)
         bpy.types.Scene.dream_textures_progress = bpy.props.IntProperty(name="", default=0, min=0, max=0)
         bpy.types.Scene.dream_textures_info = bpy.props.StringProperty(name="Info")
+        bpy.types.Scene.dream_textures_last_execution_time = bpy.props.StringProperty(name="Last Execution Time", default="")
 
         bpy.types.Scene.dream_textures_viewport_enabled = BoolProperty(name="Viewport Enabled", default=False)
         bpy.types.Scene.dream_textures_render_properties_enabled = BoolProperty(default=False)
@@ -101,12 +103,25 @@ if current_process().name != "__actor__":
         bpy.types.Scene.dream_textures_project_prompt = PointerProperty(type=DreamPrompt)
         bpy.types.Scene.dream_textures_project_framebuffer_arguments = EnumProperty(name="Inputs", items=framebuffer_arguments)
         bpy.types.Scene.dream_textures_project_bake = BoolProperty(name="Bake", default=False, description="Re-maps the generated texture onto the specified UV map")
+        def project_use_controlnet(self, context):
+            if self.dream_textures_project_use_control_net:
+                if len(self.dream_textures_project_prompt.control_nets) < 1:
+                    self.dream_textures_project_prompt.control_nets.add()
+            else:
+                self.dream_textures_project_prompt.control_nets.clear()
+        bpy.types.Scene.dream_textures_project_use_control_net = BoolProperty(name="Use ControlNet", default=False, description="Use a depth ControlNet instead of a depth model", update=project_use_controlnet)
+
+        engine.register()
 
         for cls in CLASSES:
             bpy.utils.register_class(cls)
 
         for tool in TOOLS:
             bpy.utils.register_tool(tool)
+
+        bpy.types.Scene.dream_textures_render_engine = PointerProperty(type=engine.DreamTexturesRenderEngineProperties)
+
+        bpy.types.RENDER_PT_context.append(engine.draw_device)
 
         # Monkey patch cycles render passes
         register_render_pass()
@@ -121,6 +136,10 @@ if current_process().name != "__actor__":
             bpy.utils.unregister_class(cls)
         for tool in TOOLS:
             bpy.utils.unregister_tool(tool)
+
+        bpy.types.RENDER_PT_context.remove(engine.draw_device)
+
+        engine.unregister()
         
         unregister_render_pass()
 

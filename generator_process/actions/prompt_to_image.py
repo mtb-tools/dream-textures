@@ -1,7 +1,9 @@
 from typing import Annotated, Union, _AnnotatedAlias, Generator, Callable, List, Optional, Any
 import enum
+import functools
 import math
 import os
+import sys
 from dataclasses import dataclass
 from contextlib import nullcontext
 
@@ -9,7 +11,7 @@ from numpy.typing import NDArray
 import numpy as np
 import random
 from .detect_seamless import SeamlessAxes
-from ...absolute_path import absolute_path
+from ..models.upscale_tiler import tiled_decode_latents
 
 from ..models import Pipeline
 
@@ -33,7 +35,7 @@ class CachedPipeline:
     def is_valid(self, properties: tuple):
         return properties == self.invalidation_properties
 
-def load_pipe(self, action, generator_pipeline, model, optimizations, scheduler, device):
+def load_pipe(self, action, generator_pipeline, model, optimizations, scheduler, device, **kwargs):
     """
     Use a cached pipeline, or create the pipeline class and cache it.
     
@@ -44,7 +46,7 @@ def load_pipe(self, action, generator_pipeline, model, optimizations, scheduler,
 
     invalidation_properties = (
         action, model, device,
-        optimizations.can_use("sequential_cpu_offload", device),
+        optimizations.can_use_cpu_offload(device),
         optimizations.can_use("half_precision", device),
     )
     cached_pipe: CachedPipeline = self._cached_pipe if hasattr(self, "_cached_pipe") else None
@@ -63,17 +65,20 @@ def load_pipe(self, action, generator_pipeline, model, optimizations, scheduler,
             snapshot_folder,
             revision=revision,
             torch_dtype=torch.float16 if optimizations.can_use_half(device) else torch.float32,
+            **kwargs
         )
-        pipe = pipe.to(device)
+        if optimizations.can_use_cpu_offload(device) == "off":
+            pipe = pipe.to(device)
         setattr(self, "_cached_pipe", CachedPipeline(pipe, invalidation_properties, snapshot_folder))
         cached_pipe = self._cached_pipe
-    if 'scheduler' in os.listdir(cached_pipe.snapshot_folder):
-        pipe.scheduler = scheduler.create(pipe, {
-            'model_path': cached_pipe.snapshot_folder,
-            'subfolder': 'scheduler',
-        })
-    else:
-        pipe.scheduler = scheduler.create(pipe, None)
+    if scheduler is not None:
+        if 'scheduler' in os.listdir(cached_pipe.snapshot_folder):
+            pipe.scheduler = scheduler.create(pipe, {
+                'model_path': cached_pipe.snapshot_folder,
+                'subfolder': 'scheduler',
+            })
+        else:
+            pipe.scheduler = scheduler.create(pipe, None)
     return pipe
 
 class Scheduler(enum.Enum):
@@ -147,24 +152,39 @@ class Optimizations:
     tf32: Annotated[bool, "cuda"] = False
     amp: Annotated[bool, "cuda"] = False
     half_precision: Annotated[bool, {"cuda", "privateuseone"}] = True
-    sequential_cpu_offload: Annotated[bool, {"cuda", "privateuseone"}] = False
+    cpu_offload: Annotated[str, {"cuda", "privateuseone"}] = "off"
     channels_last_memory_format: bool = False
-    # xformers_attention: bool = False # FIXME: xFormers is not yet available.
+    sdp_attention: Annotated[bool, {"cpu", "cuda", "mps"}] = True
     batch_size: int = 1
     vae_slicing: bool = True
+    vae_tiling: str = "off"
+    vae_tile_size: int = 512
+    vae_tile_blend: int = 64
+    cfg_end: float = 1.0
 
     cpu_only: bool = False
 
-    def can_use(self, property, device) -> bool:
-        if not getattr(self, property):
-            return False
-        if isinstance(self.__annotations__.get(property, None), _AnnotatedAlias):
-            annotation: _AnnotatedAlias = self.__annotations__[property]
+    @staticmethod
+    def infer_device() -> str:
+        if sys.platform == "darwin":
+            return "mps"
+        elif Pipeline.directml_available():
+            return "privateuseone"
+        else:
+            return "cuda"
+
+    @classmethod
+    def device_supports(cls, property, device) -> bool:
+        annotation = cls.__annotations__.get(property, None)
+        if isinstance(annotation, _AnnotatedAlias):
             opt_dev = annotation.__metadata__[0]
             if isinstance(opt_dev, str):
                 return opt_dev == device
             return device in opt_dev
-        return True
+        return annotation is not None
+
+    def can_use(self, property, device) -> bool:
+        return self.device_supports(property, device) and getattr(self, property)
 
     def can_use_half(self, device):
         if self.half_precision and device == "cuda":
@@ -172,6 +192,9 @@ class Optimizations:
             name = torch.cuda.get_device_name()
             return not ("GTX 1650" in name or "GTX 1660" in name)
         return self.can_use("half_precision", device)
+
+    def can_use_cpu_offload(self, device):
+        return self.cpu_offload if self.device_supports("cpu_offload", device) else "off"
     
     def apply(self, pipeline, device):
         """
@@ -185,25 +208,47 @@ class Optimizations:
         torch.backends.cuda.matmul.allow_tf32 = self.can_use("tf32", device)
 
         try:
-            if self.can_use("attention_slicing", device):
+            if self.can_use("sdp_attention", device):
+                from diffusers.models.cross_attention import AttnProcessor2_0
+                pipeline.unet.set_attn_processor(AttnProcessor2_0())
+            elif self.can_use("attention_slicing", device):
                 pipeline.enable_attention_slicing(self.attention_slice_size)
             else:
-                pipeline.disable_attention_slicing()
+                pipeline.disable_attention_slicing()  # will also disable AttnProcessor2_0
         except: pass
         
         try:
-            if self.can_use("sequential_cpu_offload", device) and device in ["cuda", "privateuseone"]:
-                # Doesn't allow for selecting execution device
-                # pipeline.enable_sequential_cpu_offload()
+            if pipeline.device != pipeline._execution_device:
+                pass # pipeline is already offloaded, offloading again can cause `pipeline._execution_device` to be incorrect
+            elif self.can_use_cpu_offload(device) == "model":
+                # adapted from diffusers.StableDiffusionPipeline.enable_model_cpu_offload() to allow DirectML device and unimplemented pipelines
+                from accelerate import cpu_offload_with_hook
 
+                hook = None
+                models = [pipeline.text_encoder, pipeline.unet, pipeline.vae]
+                if hasattr(pipeline, "controlnet"):
+                    models.append(pipeline.controlnet)
+                for cpu_offloaded_model in models:
+                    _, hook = cpu_offload_with_hook(cpu_offloaded_model, device, prev_module_hook=hook)
+
+                # FIXME: due to the safety checker not running it prevents the VAE from being offloaded, uncomment when safety checker is enabled
+                # if pipeline.safety_checker is not None:
+                #     _, hook = cpu_offload_with_hook(pipeline.safety_checker, device, prev_module_hook=hook)
+
+                # We'll offload the last model manually.
+                pipeline.final_offload_hook = hook
+            elif self.can_use_cpu_offload(device) == "submodule":
+                # adapted from diffusers.StableDiffusionPipeline.enable_sequential_cpu_offload() to allow DirectML device and unimplemented pipelines
                 from accelerate import cpu_offload
 
-                for cpu_offloaded_model in [pipeline.unet, pipeline.text_encoder, pipeline.vae]:
-                    if cpu_offloaded_model is not None:
-                        cpu_offload(cpu_offloaded_model, device)
+                models = [pipeline.text_encoder, pipeline.unet, pipeline.vae]
+                if hasattr(pipeline, "controlnet"):
+                    models.append(pipeline.controlnet)
+                for cpu_offloaded_model in models:
+                    cpu_offload(cpu_offloaded_model, device)
 
                 if pipeline.safety_checker is not None:
-                    cpu_offload(pipeline.safety_checker.vision_model, device)
+                    cpu_offload(pipeline.safety_checker.vision_model, device, offload_buffers=True)
         except: pass
         
         try:
@@ -213,10 +258,6 @@ class Optimizations:
                 pipeline.unet.to(memory_format=torch.contiguous_format)
         except: pass
 
-        # FIXME: xFormers wheels are not yet available (https://github.com/facebookresearch/xformers/issues/533)
-        # if self.can_use("xformers_attention", device):
-        #     pipeline.enable_xformers_memory_efficient_attention()
-
         try:
             if self.can_use("vae_slicing", device):
                 # Not many pipelines implement the enable_vae_slicing()/disable_vae_slicing()
@@ -224,6 +265,15 @@ class Optimizations:
                 pipeline.vae.enable_slicing()
             else:
                 pipeline.vae.disable_slicing()
+        except: pass
+
+        try:
+            if self.vae_tiling != "off":
+                if not isinstance(pipeline.decode_latents, functools.partial):
+                    pipeline.decode_latents = functools.partial(tiled_decode_latents.__get__(pipeline), pre_patch=pipeline.decode_latents)
+                pipeline.decode_latents.keywords['optimizations'] = self
+            elif self.vae_tiling == "off" and isinstance(pipeline.decode_latents, functools.partial):
+                pipeline.decode_latents = pipeline.decode_latents.keywords["pre_patch"]
         except: pass
         
         from .. import directml_patches
@@ -291,7 +341,7 @@ class ImageGenerationResult:
                 )
         return ImageGenerationResult(
             [],
-            [seeds],
+            seeds,
             iteration,
             False
         )
@@ -363,6 +413,8 @@ def model_snapshot_folder(model, preferred_revision: str | None = None):
     """ Try to find the preferred revision, but fallback to another revision if necessary. """
     import diffusers
     storage_folder = os.path.join(diffusers.utils.DIFFUSERS_CACHE, model)
+    if not os.path.exists(os.path.join(storage_folder, "refs")):
+        storage_folder = os.path.join(diffusers.utils.hub_utils.old_diffusers_cache, model)
     if os.path.exists(os.path.join(storage_folder, 'model_index.json')): # converted model
         snapshot_folder = storage_folder
     else: # hub model
@@ -490,6 +542,11 @@ def prompt_to_image(
 
                     # 7. Denoising loop
                     for i, t in enumerate(self.progress_bar(timesteps)):
+                        # NOTE: Modified to support disabling CFG
+                        if do_classifier_free_guidance and (i / len(timesteps)) >= kwargs['cfg_end']:
+                            do_classifier_free_guidance = False
+                            text_embeddings = text_embeddings[text_embeddings.size(0) // 2:]
+
                         # expand the latents if we are doing classifier free guidance
                         latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                         latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
@@ -514,6 +571,10 @@ def prompt_to_image(
                     # TODO: Add UI to enable this.
                     # 9. Run safety checker
                     # image, has_nsfw_concept = self.run_safety_checker(image, device, text_embeddings.dtype)
+
+                    # Offload last model to CPU
+                    if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
+                        self.final_offload_hook.offload()
 
                     # NOTE: Modified to yield the decoded image as a numpy array.
                     yield ImageGenerationResult(
@@ -550,25 +611,25 @@ def prompt_to_image(
             _configure_model_padding(pipe.vae, seamless_axes)
 
             # Inference
-            with (torch.inference_mode() if device not in ('mps', "privateuseone") else nullcontext()), \
-                (torch.autocast(device) if optimizations.can_use("amp", device) else nullcontext()):
-                    yield from pipe(
-                        prompt=prompt,
-                        height=height,
-                        width=width,
-                        num_inference_steps=steps,
-                        guidance_scale=cfg_scale,
-                        negative_prompt=negative_prompt if use_negative_prompt else None,
-                        num_images_per_prompt=1,
-                        eta=0.0,
-                        generator=generator,
-                        latents=None,
-                        output_type="pil",
-                        return_dict=True,
-                        callback=None,
-                        callback_steps=1,
-                        step_preview_mode=step_preview_mode
-                    )
+            with torch.inference_mode() if device not in ('mps', "privateuseone") else nullcontext():
+                yield from pipe(
+                    prompt=prompt,
+                    height=height,
+                    width=width,
+                    num_inference_steps=steps,
+                    guidance_scale=cfg_scale,
+                    negative_prompt=negative_prompt if use_negative_prompt else None,
+                    num_images_per_prompt=1,
+                    eta=0.0,
+                    generator=generator,
+                    latents=None,
+                    output_type="pil",
+                    return_dict=True,
+                    callback=None,
+                    callback_steps=1,
+                    step_preview_mode=step_preview_mode,
+                    cfg_end=optimizations.cfg_end
+                )
         case Pipeline.STABILITY_SDK:
             import stability_sdk.client
             import stability_sdk.interfaces.gooseai.generation.generation_pb2
@@ -635,6 +696,11 @@ def _configure_model_padding(model, seamless_axes):
     Modifies the 2D convolution layers to use a circular padding mode based on the `seamless` and `seamless_axes` options.
     """
     seamless_axes = SeamlessAxes(seamless_axes)
+    if seamless_axes == SeamlessAxes.AUTO:
+        seamless_axes = seamless_axes.OFF
+    if getattr(model, "seamless_axes", SeamlessAxes.OFF) == seamless_axes:
+        return
+    model.seamless_axes = seamless_axes
     for m in model.modules():
         if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
             if seamless_axes.x or seamless_axes.y:

@@ -105,6 +105,10 @@ def image_to_image(
                     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
                     with self.progress_bar(total=num_inference_steps) as progress_bar:
                         for i, t in enumerate(timesteps):
+                            # NOTE: Modified to support disabling CFG
+                            if do_classifier_free_guidance and (i / len(timesteps)) >= kwargs['cfg_end']:
+                                do_classifier_free_guidance = False
+                                text_embeddings = text_embeddings[text_embeddings.size(0) // 2:]
                             # expand the latents if we are doing classifier free guidance
                             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
@@ -131,11 +135,17 @@ def image_to_image(
                     # TODO: Add UI to enable this
                     # 10. Run safety checker
                     # image, has_nsfw_concept = self.run_safety_checker(image, device, text_embeddings.dtype)
+                    
+                    image = self.image_processor.postprocess(image, output_type=output_type)
+
+                    # Offload last model to CPU
+                    if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
+                        self.final_offload_hook.offload()
 
                     # NOTE: Modified to yield the decoded image as a numpy array.
                     yield ImageGenerationResult(
                         [np.asarray(ImageOps.flip(image).convert('RGBA'), dtype=np.float32) / 255.
-                            for i, image in enumerate(self.numpy_to_pil(image))],
+                            for i, image in enumerate(image)],
                         [gen.initial_seed() for gen in generator] if isinstance(generator, list) else [generator.initial_seed()],
                         num_inference_steps,
                         True
@@ -180,24 +190,24 @@ def image_to_image(
             _configure_model_padding(pipe.vae, seamless_axes)
 
             # Inference
-            with (torch.inference_mode() if device not in ('mps', "privateuseone") else nullcontext()), \
-                    (torch.autocast(device) if optimizations.can_use("amp", device) else nullcontext()):
-                    yield from pipe(
-                        prompt=prompt,
-                        image=[init_image] * batch_size,
-                        strength=strength,
-                        num_inference_steps=steps,
-                        guidance_scale=cfg_scale,
-                        negative_prompt=negative_prompt if use_negative_prompt else None,
-                        num_images_per_prompt=1,
-                        eta=0.0,
-                        generator=generator,
-                        output_type="pil",
-                        return_dict=True,
-                        callback=None,
-                        callback_steps=1,
-                        step_preview_mode=step_preview_mode
-                    )
+            with torch.inference_mode() if device not in ('mps', "privateuseone") else nullcontext():
+                yield from pipe(
+                    prompt=prompt,
+                    image=[init_image] * batch_size,
+                    strength=strength,
+                    num_inference_steps=steps,
+                    guidance_scale=cfg_scale,
+                    negative_prompt=negative_prompt if use_negative_prompt else None,
+                    num_images_per_prompt=1,
+                    eta=0.0,
+                    generator=generator,
+                    output_type="pil",
+                    return_dict=True,
+                    callback=None,
+                    callback_steps=1,
+                    step_preview_mode=step_preview_mode,
+                    cfg_end=optimizations.cfg_end
+                )
         case Pipeline.STABILITY_SDK:
             import stability_sdk.client
             import stability_sdk.interfaces.gooseai.generation.generation_pb2

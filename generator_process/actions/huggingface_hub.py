@@ -15,7 +15,7 @@ from pathlib import Path
 import requests
 import json
 import enum
-
+from ..future import Future
 
 class ModelType(enum.IntEnum):
     """
@@ -27,6 +27,8 @@ class ModelType(enum.IntEnum):
     DEPTH = 5
     UPSCALING = 7
     INPAINTING = 9
+
+    CONTROL_NET = -1
 
     @classmethod
     def _missing_(cls, _):
@@ -96,14 +98,24 @@ def hf_list_installed_models(self) -> list[Model]:
 
     DIFFUSERS_CACHE = Path(DIFFUSERS_CACHE)
 
-    if not DIFFUSERS_CACHE.exists():
-        return []
+
+    def list_dir(cache_dir):
+        if not cache_dir.exists():
+            return []
 
     def detect_model_type(snapshot_folder):
-        unet_config = os.path.join(snapshot_folder, "unet", "config.json")
+        unet_config = os.path.join(snapshot_folder, 'unet', 'config.json')
+        config = os.path.join(snapshot_folder, 'config.json')
         if os.path.exists(unet_config):
-            with open(unet_config, "r") as f:
-                return ModelType(json.load(f)["in_channels"])
+            with open(unet_config, 'r') as f:
+                return ModelType(json.load(f)['in_channels'])
+        elif os.path.exists(config):
+            with open(config, 'r') as f:
+                config_dict = json.load(f)
+                if '_class_name' in config_dict and config_dict['_class_name'] == 'ControlNetModel':
+                    return ModelType.CONTROL_NET
+                else:
+                    return ModelType.UNKNOWN
         else:
             return ModelType.UNKNOWN
 
@@ -151,40 +163,29 @@ class DownloadStatus:
 
 
 def hf_snapshot_download(
-    self, model: str, token: str, revision: str | None = None
-) -> Generator[DownloadStatus, None, None]:
-    from filelock import FileLock
-    from huggingface_hub.constants import (
-        DEFAULT_REVISION,
-        HUGGINGFACE_HEADER_X_REPO_COMMIT,
-        HUGGINGFACE_HUB_CACHE,
-        REPO_TYPES,
-    )
-    from huggingface_hub.file_download import (
-        REGEX_COMMIT_HASH,
-        repo_folder_name,
-        hf_hub_url,
-        _request_wrapper,
-        hf_raise_for_status,
-        logger,
-        cached_download,
-        build_hf_headers,
-        get_hf_file_metadata,
-        _cache_commit_hash_for_specific_revision,
-        OfflineModeIsEnabled,
-        _create_relative_symlink,
-    )
-    from huggingface_hub.hf_api import HfApi
-    from huggingface_hub.utils import (
-        filter_repo_objects,
-        validate_hf_hub_args,
-        tqdm,
-        logging,
-        EntryNotFoundError,
-        LocalEntryNotFoundError,
-        RevisionNotFoundError,
-    )
+    self,
+    model: str,
+    token: str,
+    revision: str | None = None
+):
+    from huggingface_hub import utils
 
+    future = Future()
+    yield future
+
+    class future_tqdm(utils.tqdm):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            future.add_response(DownloadStatus(self.desc, 0, self.total))
+
+        def update(self, n=1):
+            future.add_response(DownloadStatus(self.desc, self.last_print_n + n, self.total))
+            return super().update(n=n)
+    
+    from huggingface_hub import file_download
+    file_download.tqdm = future_tqdm
+    from huggingface_hub import _snapshot_download
+    
     from diffusers import StableDiffusionPipeline
     from diffusers.utils import (
         DIFFUSERS_CACHE,
@@ -193,26 +194,21 @@ def hf_snapshot_download(
         ONNX_WEIGHTS_NAME,
     )
     from diffusers.schedulers.scheduling_utils import SCHEDULER_CONFIG_NAME
-    from diffusers.utils.hub_utils import http_user_agent
-
-    config_dict = StableDiffusionPipeline.load_config(
-        model,
-        cache_dir=DIFFUSERS_CACHE,
-        resume_download=True,
-        force_download=False,
-        use_auth_token=token,
-    )
-    # make sure we only download sub-folders and `diffusers` filenames
-    folder_names = [k for k in config_dict.keys() if not k.startswith("_")]
-    allow_patterns = [os.path.join(k, "*") for k in folder_names]
-    allow_patterns += [
-        WEIGHTS_NAME,
-        SCHEDULER_CONFIG_NAME,
-        CONFIG_NAME,
-        ONNX_WEIGHTS_NAME,
-        StableDiffusionPipeline.config_name,
-    ]
-
+    
+    try:
+        config_dict = StableDiffusionPipeline.load_config(
+            model,
+            cache_dir=DIFFUSERS_CACHE,
+            resume_download=True,
+            force_download=False,
+            use_auth_token=token
+        )
+        folder_names = [k for k in config_dict.keys() if not k.startswith("_")]
+        allow_patterns = [os.path.join(k, "*") for k in folder_names]
+        allow_patterns += [WEIGHTS_NAME, SCHEDULER_CONFIG_NAME, CONFIG_NAME, ONNX_WEIGHTS_NAME, StableDiffusionPipeline.config_name]
+    except:
+        allow_patterns = None
+    
     # make sure we don't download flax, safetensors, or ckpt weights.
     ignore_patterns = ["*.msgpack", "*.safetensors", "*.ckpt"]
 
@@ -673,23 +669,23 @@ def hf_snapshot_download(
             yield DownloadStatus(repo_file, i + 1, len(filtered_repo_files))
 
     try:
-        yield from snapshot_download(
+        _snapshot_download.snapshot_download(
             model,
+            cache_dir=DIFFUSERS_CACHE,
+            token=token,
             revision=revision,
-            cache_dir=DIFFUSERS_CACHE,
             resume_download=True,
-            use_auth_token=token,
             allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            user_agent=user_agent,
+            ignore_patterns=ignore_patterns
         )
-    except RevisionNotFoundError:
-        yield from snapshot_download(
+    except utils._errors.RevisionNotFoundError:
+        _snapshot_download.snapshot_download(
             model,
             cache_dir=DIFFUSERS_CACHE,
+            token=token,
             resume_download=True,
-            use_auth_token=token,
             allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            user_agent=user_agent,
+            ignore_patterns=ignore_patterns
         )
+
+    future.set_done()

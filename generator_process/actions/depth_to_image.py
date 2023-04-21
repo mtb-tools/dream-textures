@@ -277,6 +277,11 @@ def depth_to_image(
                     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
                     with self.progress_bar(total=num_inference_steps) as progress_bar:
                         for i, t in enumerate(timesteps):
+                            # NOTE: Modified to support disabling CFG
+                            if do_classifier_free_guidance and (i / len(timesteps)) >= kwargs['cfg_end']:
+                                do_classifier_free_guidance = False
+                                text_embeddings = text_embeddings[text_embeddings.size(0) // 2:]
+                                depth = depth[depth.size(0) // 2:]
                             # expand the latents if we are doing classifier free guidance
                             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
 
@@ -306,6 +311,10 @@ def depth_to_image(
                     # TODO: Add UI to enable this.
                     # 12. Run safety checker
                     # image, has_nsfw_concept = self.run_safety_checker(image, device, text_embeddings.dtype)
+
+                    # Offload last model to CPU
+                    if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
+                        self.final_offload_hook.offload()
 
                     # NOTE: Modified to yield the decoded image as a numpy array.
                     yield ImageGenerationResult(
@@ -362,8 +371,7 @@ def depth_to_image(
             _configure_model_padding(pipe.vae, seamless_axes)
 
             # Inference
-            with (torch.inference_mode() if device not in ('mps', "privateuseone") else nullcontext()), \
-                (torch.autocast(device) if optimizations.can_use("amp", device) else nullcontext()):
+            with torch.inference_mode() if device not in ('mps', "privateuseone") else nullcontext():
                 yield from pipe(
                     prompt=prompt,
                     depth_image=depth_image,
@@ -382,7 +390,8 @@ def depth_to_image(
                     return_dict=True,
                     callback=None,
                     callback_steps=1,
-                    step_preview_mode=step_preview_mode
+                    step_preview_mode=step_preview_mode,
+                    cfg_end=optimizations.cfg_end
                 )
         case Pipeline.STABILITY_SDK:
             import stability_sdk
